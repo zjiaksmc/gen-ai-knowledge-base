@@ -3,23 +3,20 @@ import ast
 import html
 import json
 import os
+import io
 import re
-import requests
-# import openai
+from datetime import datetime
 from openai import AzureOpenAI
 import re
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from typing import Callable, List, Dict, Optional, Generator, Tuple, Union
 
 import markdown
 import tiktoken
-from azure.identity import DefaultAzureCredential
-# from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from azure.storage.blob import ContainerClient
@@ -28,40 +25,66 @@ from langchain.text_splitter import TextSplitter, MarkdownTextSplitter, Recursiv
 from tqdm import tqdm
 from typing import Any
 
+from ..config import *
+from ..model import Document, DocumentIngestion, ChunkingResult
+from ..utils.watchtower import IngestionWatchTower
+from ..utils.transport import xlsx2html
+
+
 FILE_FORMAT_DICT = {
         "md": "markdown",
-        "txt": "text",
+        # "txt": "text",
         "html": "html",
         "shtml": "html",
         "htm": "html",
-        "py": "python",
+        # "py": "python",
         "pdf": "pdf",
         "docx": "pdf",
-        "xlsx": "pdf",
+        "xlsx": "html",
         "pptx": "pdf",
         "png": "pdf",
         "jpeg": "pdf",
-        "tiff": "pdf",
-        "heif": "pdf"
+        # "tiff": "pdf",
+        # "heif": "pdf"
     }
-
 RETRY_COUNT = 5
-
+RETRY_SPAN = 10
 SENTENCE_ENDINGS = [".", "!", "?"]
 WORDS_BREAKS = list(reversed([",", ";", ":", " ", "(", ")", "[", "]", "{", "}", "\t", "\n"]))
-
 HTML_TABLE_TAGS = {"table_open": "<table>", "table_close": "</table>", "row_open":"<tr>"}
-
 PDF_HEADERS = {
     "title": "h1",
     "sectionHeading": "h2"
 }
 
+
+class BytesIOWrapper(io.BufferedReader):
+    """Wrap a buffered bytes stream over TextIOBase string stream."""
+
+    def __init__(self, text_io_buffer, encoding=None, errors=None, **kwargs):
+        super(BytesIOWrapper, self).__init__(text_io_buffer, **kwargs)
+        self.encoding = encoding or text_io_buffer.encoding or 'utf-8'
+        self.errors = errors or text_io_buffer.errors or 'strict'
+
+    def _encoding_call(self, method_name, *args, **kwargs):
+        raw_method = getattr(self.raw, method_name)
+        val = raw_method(*args, **kwargs)
+        return val.encode(self.encoding, errors=self.errors)
+
+    def read(self, size=-1):
+        return self._encoding_call('read', size)
+
+    def read1(self, size=-1):
+        return self._encoding_call('read1', size)
+
+    def peek(self, size=-1):
+        return self._encoding_call('peek', size)
+    
+
 class TokenEstimator(object):
     GPT2_TOKENIZER = tiktoken.get_encoding("gpt2")
 
     def estimate_tokens(self, text: Union[str, List]) -> int:
-
         return len(self.GPT2_TOKENIZER.encode(text, allowed_special="all"))
 
     def construct_tokens_with_size(self, tokens: str, numofTokens: int) -> str:
@@ -71,6 +94,7 @@ class TokenEstimator(object):
         return newTokens
 
 TOKEN_ESTIMATOR = TokenEstimator()
+
 
 class PdfTextSplitter(TextSplitter):
     def __init__(self, length_function: Callable[[str], int] =TOKEN_ESTIMATOR.estimate_tokens, separator: str = "\n\n", **kwargs: Any):
@@ -90,13 +114,11 @@ class PdfTextSplitter(TextSplitter):
             if _s in text:
                 separator = _s
                 break
-        
         # Now that we have the separator, split the text
         if separator:
             lines = text.split(separator)
         else:
             lines = list(text)
-        
         # remove empty lines
         lines = [line for line in lines if line!='']
         caption = ""
@@ -137,8 +159,6 @@ class PdfTextSplitter(TextSplitter):
         final_final_chunks = [chunk for chunk, chunk_size in merge_chunks_serially(final_chunks, self._chunk_size)]
 
         return final_final_chunks
-
-
 
     def chunk_rest(self, item):
         separator = self._separators[-1]
@@ -209,27 +229,6 @@ class PdfTextSplitter(TextSplitter):
                 tables.append(current_table)
             return tables
 
-    
-@dataclass
-class Document(object):
-    """A data class for storing documents
-
-    Attributes:
-        content (str): The content of the document.
-        id (Optional[str]): The id of the document.
-        title (Optional[str]): The title of the document.
-        filepath (Optional[str]): The filepath of the document.
-        url (Optional[str]): The url of the document.
-        metadata (Optional[Dict]): The metadata of the document.    
-    """
-
-    content: str
-    id: Optional[str] = None
-    title: Optional[str] = None
-    filepath: Optional[str] = None
-    url: Optional[str] = None
-    metadata: Optional[Dict] = None
-    contentVector: Optional[List[float]] = None
 
 def cleanup_content(content: str) -> str:
     """Cleans up the given content using regexes
@@ -243,6 +242,7 @@ def cleanup_content(content: str) -> str:
     output = re.sub(r"-{2,}", "--", output)
 
     return output.strip()
+
 
 class BaseParser(ABC):
     """A parser parses content to produce a document."""
@@ -281,6 +281,7 @@ class BaseParser(ABC):
             if os.path.isfile(file_path):
                 documents.append(self.parse_file(file_path))
         return documents
+
 
 class MarkdownParser(BaseParser):
     """Parses Markdown content."""
@@ -352,6 +353,7 @@ class HTMLParser(BaseParser):
 
         return Document(content=cleanup_content(result), title=str(title))
 
+
 class TextParser(BaseParser):
     """Parses text content."""
 
@@ -415,6 +417,7 @@ class PythonParser(BaseParser):
     def __init__(self) -> None:
         super().__init__()
 
+
 class ParserFactory:
     def __init__(self):
         self._parsers = {
@@ -438,34 +441,19 @@ class ParserFactory:
 
 parser_factory = ParserFactory()
 
+
 class UnsupportedFormatError(Exception):
     """Exception raised when a format is not supported by a parser."""
 
     pass
 
-@dataclass
-class ChunkingResult:
-    """Data model for chunking result
-
-    Attributes:
-        chunks (List[Document]): List of chunks.
-        total_files (int): Total number of files.
-        num_unsupported_format_files (int): Number of files with unsupported format.
-        num_files_with_errors (int): Number of files with errors.
-        skipped_chunks (int): Number of chunks skipped.
-    """
-    chunks: List[Document]
-    total_files: int
-    num_unsupported_format_files: int = 0
-    num_files_with_errors: int = 0
-    # some chunks might be skipped to small number of tokens
-    skipped_chunks: int = 0
 
 def extractStorageDetailsFromUrl(url):
     matches = re.fullmatch(r'https:\/\/([^\/.]*)\.blob\.core\.windows\.net\/([^\/]*)\/(.*)', url)
     if not matches:
-        raise Exception(f"Not a valid blob storage URL: {url}")
+        raise ValueError(f"Not a valid blob storage URL: {url}")
     return (matches.group(1), matches.group(2), matches.group(3))
+
 
 def downloadBlobUrlToLocalFolder(blob_url, local_folder, credential):
     (storage_account, container_name, path) = extractStorageDetailsFromUrl(blob_url)
@@ -473,19 +461,17 @@ def downloadBlobUrlToLocalFolder(blob_url, local_folder, credential):
     container_client = ContainerClient.from_container_url(container_url, credential=credential)
     if path and not path.endswith('/'):
         path = path + '/'
-
-    last_destination_folder = None
     for blob in container_client.list_blobs(name_starts_with=path):
-        relative_path = blob.name[len(path):]
-        destination_path = os.path.join(local_folder, relative_path)
-        destination_folder = os.path.dirname(destination_path)
-        if destination_folder != last_destination_folder:
+        if blob.size > 0:
+            relative_path = blob.name[len(path):]
+            destination_path = os.path.join(local_folder, relative_path)
+            destination_folder = os.path.dirname(destination_path)
             os.makedirs(destination_folder, exist_ok=True)
-            last_destination_folder = destination_folder
-        blob_client = container_client.get_blob_client(blob.name)
-        with open(file=destination_path, mode='wb') as local_file:
-            stream = blob_client.download_blob()
-            local_file.write(stream.readall())
+            blob_client = container_client.get_blob_client(blob.name)
+            with open(file=destination_path, mode='wb') as local_file:
+                stream = blob_client.download_blob()
+                local_file.write(stream.readall())
+
 
 def get_files_recursively(directory_path: str) -> List[str]:
     """Gets all files in the given directory recursively.
@@ -501,10 +487,12 @@ def get_files_recursively(directory_path: str) -> List[str]:
             file_paths.append(file_path)
     return file_paths
 
+
 def convert_escaped_to_posix(escaped_path):
     windows_path = escaped_path.replace("\\\\", "\\")
     posix_path = windows_path.replace("\\", "/")
     return posix_path
+
 
 def _get_file_format(file_name: str, extensions_to_process: List[str]) -> Optional[str]:
     """Gets the file format from the file name.
@@ -520,8 +508,8 @@ def _get_file_format(file_name: str, extensions_to_process: List[str]) -> Option
     file_name = os.path.basename(file_name)
     file_extension = file_name.split(".")[-1]
     if file_extension not in extensions_to_process:
-        return None
-    return FILE_FORMAT_DICT.get(file_extension, None)
+        return None, None
+    return file_extension, FILE_FORMAT_DICT.get(file_extension, None)
 
 def table_to_html(table):
     table_html = "<table>"
@@ -544,6 +532,28 @@ def table_to_html(table):
     table_html += "</table>"
     return table_html
 
+
+def extract_xlsx_content(file_path):
+    with open(file_path, "rb") as f:
+        out_file = xlsx2html(f, locale='en')
+        out_file.seek(0)
+        content = out_file.getvalue()
+    return content
+
+
+def extract_other_content(file_path):
+    try:
+        with open(file_path, "r", encoding="utf8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        from chardet import detect
+        with open(file_path, "rb") as f:
+            binary_content = f.read()
+            encoding = detect(binary_content).get('encoding', None)
+    content = binary_content.decode(encoding if encoding else 'utf8')
+    return content
+
+
 def extract_pdf_content(file_path, form_recognizer_client, use_layout=False): 
     offset = 0
     page_map = []
@@ -551,7 +561,6 @@ def extract_pdf_content(file_path, form_recognizer_client, use_layout=False):
     with open(file_path, "rb") as f:
         poller = form_recognizer_client.begin_analyze_document(
             model,
-            # document = f,
             analyze_request=f,
             content_type="application/octet-stream"
         )
@@ -560,55 +569,58 @@ def extract_pdf_content(file_path, form_recognizer_client, use_layout=False):
     # (if using layout) mark all the positions of headers
     roles_start = {}
     roles_end = {}
-    for paragraph in form_recognizer_results.paragraphs:
-        if paragraph.role!=None:
-            para_start = paragraph.spans[0].offset
-            para_end = paragraph.spans[0].offset + paragraph.spans[0].length
-            roles_start[para_start] = paragraph.role
-            roles_end[para_end] = paragraph.role
+    if form_recognizer_results.paragraphs:
+        for paragraph in form_recognizer_results.paragraphs:
+            if paragraph.role!=None:
+                para_start = paragraph.spans[0].offset
+                para_end = paragraph.spans[0].offset + paragraph.spans[0].length
+                roles_start[para_start] = paragraph.role
+                roles_end[para_end] = paragraph.role
 
-    for page_num, page in enumerate(form_recognizer_results.pages):
-        tables_on_page = [table for table in form_recognizer_results.tables if (table.spans[0].offset >= page.spans[0].offset) and (table.spans[0].offset <= page.spans[0].offset+page.spans[0].length)]
+    if form_recognizer_results.pages:
+        for page_num, page in enumerate(form_recognizer_results.pages):
+            tables_on_page = [table for table in form_recognizer_results.tables if (table.spans) and (len(table.spans)>0) and (table.spans[0].offset >= page.spans[0].offset) and (table.spans[0].offset <= page.spans[0].offset+page.spans[0].length)]
 
-        # (if using layout) mark all positions of the table spans in the page
-        page_offset = page.spans[0].offset
-        page_length = page.spans[0].length
-        table_chars = [-1]*page_length
-        for table_id, table in enumerate(tables_on_page):
-            for span in table.spans:
-                # replace all table spans with "table_id" in table_chars array
-                for i in range(span.length):
-                    idx = span.offset - page_offset + i
-                    if idx >=0 and idx < page_length:
-                        table_chars[idx] = table_id
+            # (if using layout) mark all positions of the table spans in the page
+            page_offset = page.spans[0].offset
+            page_length = page.spans[0].length
+            table_chars = [-1]*page_length
+            for table_id, table in enumerate(tables_on_page):
+                for span in table.spans:
+                    # replace all table spans with "table_id" in table_chars array
+                    for i in range(span.length):
+                        idx = span.offset - page_offset + i
+                        if idx >=0 and idx < page_length:
+                            table_chars[idx] = table_id
 
-        # build page text by replacing charcters in table spans with table html and replace the characters corresponding to headers with html headers, if using layout
-        page_text = ""
-        added_tables = set()
-        for idx, table_id in enumerate(table_chars):
-            if table_id == -1:
-                position = page_offset + idx
-                if position in roles_start.keys():
-                    role = roles_start[position]
-                    if role in PDF_HEADERS:
-                        page_text += f"<{PDF_HEADERS[role]}>"
-                if position in roles_end.keys():
-                    role = roles_end[position]
-                    if role in PDF_HEADERS:
-                        page_text += f"</{PDF_HEADERS[role]}>"
+            # build page text by replacing charcters in table spans with table html and replace the characters corresponding to headers with html headers, if using layout
+            page_text = ""
+            added_tables = set()
+            for idx, table_id in enumerate(table_chars):
+                if table_id == -1:
+                    position = page_offset + idx
+                    if position in roles_start.keys():
+                        role = roles_start[position]
+                        if role in PDF_HEADERS:
+                            page_text += f"<{PDF_HEADERS[role]}>"
+                    if position in roles_end.keys():
+                        role = roles_end[position]
+                        if role in PDF_HEADERS:
+                            page_text += f"</{PDF_HEADERS[role]}>"
 
-                page_text += form_recognizer_results.content[page_offset + idx]
-                
-            elif not table_id in added_tables:
-                page_text += table_to_html(tables_on_page[table_id])
-                added_tables.add(table_id)
+                    page_text += form_recognizer_results.content[page_offset + idx]
+                    
+                elif not table_id in added_tables:
+                    page_text += table_to_html(tables_on_page[table_id])
+                    added_tables.add(table_id)
 
-        page_text += " "
-        page_map.append((page_num, offset, page_text))
-        offset += len(page_text)
+            page_text += " "
+            page_map.append((page_num, offset, page_text))
+            offset += len(page_text)
 
     full_text = "".join([page_text for _, _, page_text in page_map])
     return full_text
+
 
 def merge_chunks_serially(chunked_content_list: List[str], num_tokens: int) -> Generator[Tuple[str, int], None, None]:
     # TODO: solve for token overlap
@@ -628,39 +640,30 @@ def merge_chunks_serially(chunked_content_list: List[str], num_tokens: int) -> G
         yield current_chunk, total_size
 
 
-def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None, azure_credential=None):
-    endpoint = embedding_model_endpoint if embedding_model_endpoint else os.environ.get("EMBEDDING_MODEL_ENDPOINT")
-    key = embedding_model_key if embedding_model_key else os.environ.get("EMBEDDING_MODEL_KEY")
+def get_embedding(
+    text,
+    credential: Any = None,
+    embedding_service: Service = None
+):
+    endpoint=embedding_service.endpoint
+    key=embedding_service.secret
+    api_version=embedding_service.specs.get("api_version", "2023-08-01-preview")
     
-    if azure_credential is None and (endpoint is None or key is None):
-        raise Exception("EMBEDDING_MODEL_ENDPOINT and EMBEDDING_MODEL_KEY are required for embedding")
-
+    if credential is None and (endpoint is None or key is None):
+        raise ValueError("EMBEDDING_MODEL_ENDPOINT and EMBEDDING_MODEL_KEY are required for embedding")
     try:
         endpoint_parts = endpoint.split("/openai/deployments/")
         base_url = endpoint_parts[0]
         deployment_id = endpoint_parts[1].split("/embeddings")[0]
-
-        # openai.api_version = '2023-05-15'
-        # openai.api_base = base_url
-
-        # if azure_credential is not None:
-        #     openai.api_key = azure_credential.get_token("https://cognitiveservices.azure.com/.default").token
-        #     openai.api_type = "azure_ad"
-        # else:
-        #     openai.api_type = 'azure'
-        #     openai.api_key = key
-
         openai_client = AzureOpenAI(
             api_key = key,  
-            api_version = "2023-12-01-preview",
+            api_version = api_version,
             azure_endpoint = base_url
         )
-    
         embeddings = openai_client.embeddings.create(model=deployment_id, input=text)
         return embeddings.data[0].embedding
-
     except Exception as e:
-        raise Exception(f"Error getting embeddings with endpoint={endpoint} with error={e}")
+        raise ValueError(f"Error getting embeddings with endpoint={endpoint} with error={e}")
 
 
 def chunk_content_helper(
@@ -703,20 +706,20 @@ def chunk_content_helper(
                 chunk_size = TOKEN_ESTIMATOR.estimate_tokens(chunked_content)
                 yield chunked_content, chunk_size, doc
 
+
 def chunk_content(
     content: str,
     file_name: Optional[str] = None,
+    credential: Any = None,
     url: Optional[str] = None,
     ignore_errors: bool = False,
     num_tokens: int = 256,
     min_chunk_size: int = 10,
     token_overlap: int = 0,
-    extensions_to_process = FILE_FORMAT_DICT.keys(),
-    cracked_pdf = False,
-    use_layout = False,
-    add_embeddings = False,
-    azure_credential = None,
-    embedding_endpoint = None
+    extensions_to_process: List = FILE_FORMAT_DICT.keys(),
+    cracked_pdf: bool = False,
+    use_layout: bool = False,
+    embedding_service: Service = None
 ) -> ChunkingResult:
     """Chunks the given content. If ignore_errors is true, returns None
         in case of an error
@@ -731,18 +734,16 @@ def chunk_content(
     Returns:
         List[Document]: List of chunked documents.
     """
-
     try:
         if file_name is None or (cracked_pdf and not use_layout):
             file_format = "text"
         elif cracked_pdf:
             file_format = "html_pdf" # differentiate it from native html
         else:
-            file_format = _get_file_format(file_name, extensions_to_process)
+            _, file_format = _get_file_format(file_name, extensions_to_process)
             if file_format is None:
-                raise Exception(
+                raise ValueError(
                     f"{file_name} is not supported")
-
         chunked_context = chunk_content_helper(
             content=content,
             file_name=file_name,
@@ -754,17 +755,19 @@ def chunk_content(
         skipped_chunks = 0
         for chunk, chunk_size, doc in chunked_context:
             if chunk_size >= min_chunk_size:
-                if add_embeddings:
+                if embedding_service:
                     for _ in range(RETRY_COUNT):
                         try:
-                            doc.contentVector = get_embedding(chunk, azure_credential=azure_credential, embedding_model_endpoint=embedding_endpoint)
+                            doc.contentVector = get_embedding(
+                                chunk,
+                                credential=credential,
+                                embedding_service=embedding_service
+                            )
                             break
                         except:
-                            time.sleep(30)
+                            time.sleep(RETRY_SPAN)
                     if doc.contentVector is None:
-                        raise Exception(f"Error getting embedding for chunk={chunk}")
-                    
-
+                        raise ValueError(f"Error getting embedding for chunk={chunk}")
                 chunks.append(
                     Document(
                         content=chunk,
@@ -775,38 +778,30 @@ def chunk_content(
                 )
             else:
                 skipped_chunks += 1
-
-    except UnsupportedFormatError as e:
-        if ignore_errors:
-            return ChunkingResult(
-                chunks=[], total_files=1, num_unsupported_format_files=1
-            )
-        else:
-            raise e
+    except (UnsupportedFormatError, ValueError) as e:
+        raise e
     except Exception as e:
-        if ignore_errors:
-            return ChunkingResult(chunks=[], total_files=1, num_files_with_errors=1)
-        else:
-            raise e
+        raise e
     return ChunkingResult(
         chunks=chunks,
         total_files=1,
         skipped_chunks=skipped_chunks,
     )
 
+
 def chunk_file(
     file_path: str,
+    credential: Any = None,
     ignore_errors: bool = False,
     num_tokens=256,
     min_chunk_size=10,
     url = None,
     token_overlap: int = 0,
-    extensions_to_process = FILE_FORMAT_DICT.keys(),
-    form_recognizer_client = None,
-    use_layout = False,
-    add_embeddings=False,
-    azure_credential = None,
-    embedding_endpoint = None
+    extensions_to_process: List = FILE_FORMAT_DICT.keys(),
+    form_recognizer_client: Any = None,
+    doc_extract_service: Service = None,
+    embedding_service: Service = None,
+    ingestion_watchtower_client: IngestionWatchTower = None
 ) -> ChunkingResult:
     """Chunks the given file.
     Args:
@@ -814,81 +809,129 @@ def chunk_file(
     Returns:
         List[Document]: List of chunked documents.
     """
+    use_layout = True if doc_extract_service and doc_extract_service.specs.get("model_type") == "Layout" else False
     file_name = os.path.basename(file_path)
-    file_format = _get_file_format(file_name, extensions_to_process)
-    if not file_format:
-        if ignore_errors:
-            return ChunkingResult(
-                chunks=[], total_files=1, num_unsupported_format_files=1
-            )
-        else:
+    file_extension, file_format = _get_file_format(file_name, extensions_to_process)
+    new_ingestion = DocumentIngestion.from_dict({
+        "url": url,
+        "staging_path": file_path,
+        "created_dt": datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+    })
+    update = False
+    try:
+        if not file_format:
             raise UnsupportedFormatError(f"{file_name} is not supported")
-
-    cracked_pdf = False
-    if file_format in ["pdf"]:
-        if form_recognizer_client is None:
-            raise UnsupportedFormatError("form_recognizer_client is required for pdf files")
-        content = extract_pdf_content(file_path, form_recognizer_client, use_layout=use_layout)
-        cracked_pdf = True
-    else:
-        try:
-            with open(file_path, "r", encoding="utf8") as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            from chardet import detect
-            with open(file_path, "rb") as f:
-                binary_content = f.read()
-                encoding = detect(binary_content).get('encoding', 'utf8')
-                content = binary_content.decode(encoding)
+        # retrieve content if the file has been processed before
+        hist_ingestion = ingestion_watchtower_client.load_document_ingestion(new_ingestion)
         
-    return chunk_content(
-        content=content,
-        file_name=file_name,
-        ignore_errors=ignore_errors,
-        num_tokens=num_tokens,
-        min_chunk_size=min_chunk_size,
-        url=url,
-        token_overlap=max(0, token_overlap),
-        extensions_to_process=extensions_to_process,
-        cracked_pdf=cracked_pdf,
-        use_layout=use_layout,
-        add_embeddings=add_embeddings,
-        azure_credential=azure_credential,
-        embedding_endpoint=embedding_endpoint
-    )
+        if hist_ingestion and doc_extract_service and hist_ingestion.extraction_service_checksum == doc_extract_service.checksum:
+            content = hist_ingestion.structured_content
+            if file_format in ["pdf"]:
+                cracked_pdf = True
+            else:
+                cracked_pdf = False
+            logging.debug(f"Load previous extracted content from database for document {url}")
+        else:
+            if file_format in ["pdf"]:
+                if new_ingestion.size / (1024*1024) > 6:
+                    raise ValueError("file size is above the 6MB size limitation for the AI-based extraction service, to save cost, please double check whether this file is necessary.")
+                if form_recognizer_client is None:
+                    raise UnsupportedFormatError("form_recognizer_client is required for pdf files")
+                content = extract_pdf_content(file_path, form_recognizer_client, use_layout=use_layout)
+                if (content == "" or not content) and (use_layout == True):
+                    content = extract_pdf_content(file_path, form_recognizer_client, use_layout=False)
+                cracked_pdf = True
+            else:
+                if new_ingestion.size / (1024*1024) > 6:
+                    raise ValueError("file size is above the 6MB size limitation for the AI-based extraction service, to save cost, please double check whether this file is necessary.")
+                if file_extension in ["xlsx"]:
+                    content = extract_xlsx_content(file_path)
+                else:
+                    content = extract_other_content(file_path)
+                cracked_pdf = False
+            update = True
+            logging.debug(f"Extract content for document {url}")
+        new_ingestion.extraction_service_checksum = doc_extract_service.checksum if doc_extract_service else None
+        new_ingestion.structured_content = content
+
+        if hist_ingestion and embedding_service and hist_ingestion.embedding_service_checksum == embedding_service.checksum:
+            chunk_result = ChunkingResult.from_json(hist_ingestion.embedding)
+            logging.debug(f"Load previous embedding content from database for document {url}")
+        else:
+            chunk_result = chunk_content(
+                content=content,
+                file_name=file_name,
+                credential=credential,
+                ignore_errors=ignore_errors,
+                num_tokens=num_tokens,
+                min_chunk_size=min_chunk_size,
+                url=url,
+                token_overlap=max(0, token_overlap),
+                extensions_to_process=extensions_to_process,
+                cracked_pdf=cracked_pdf,
+                use_layout=use_layout,
+                embedding_service=embedding_service
+            )
+            update = True
+            logging.debug(f"Embedding content for document {url}")
+        new_ingestion.embedding_service_checksum = embedding_service.checksum if embedding_service else None
+        new_ingestion.embedding = chunk_result.to_json()
+        new_ingestion.status = "ready"
+        new_ingestion.error = None
+    except (UnsupportedFormatError, ValueError) as e:
+        new_ingestion.status = "error"
+        new_ingestion.error = str(e)
+        chunk_result = ChunkingResult(
+            chunks=[], total_files=1, num_unsupported_format_files=1
+        )
+        update = True
+        logging.debug(f"Failed to extract content for document {url} due to {str(e)}")
+    except Exception as e:
+        new_ingestion.status = "error"
+        new_ingestion.error = str(e)
+        chunk_result = ChunkingResult(
+            chunks=[], total_files=1, num_unsupported_format_files=1
+        )
+        update = True
+        logging.error(f"Failed to extract content for document {url} due to {str(e)}")
+
+    if update:
+        new_ingestion.updated_dt = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        new_ingestion.updated_dt = hist_ingestion.updated_dt
+    ingestion_watchtower_client.persist_document_ingestion(new_ingestion)
+
+    return chunk_result
 
 
 def process_file(
-        file_path: str, # !IMP: Please keep this as the first argument
-        directory_path: str,
-        ignore_errors: bool = False,
-        num_tokens: int = 1024,
-        min_chunk_size: int = 10,
-        url_prefix = None,
-        token_overlap: int = 0,
-        extensions_to_process: List[str] = FILE_FORMAT_DICT.keys(),
-        form_recognizer_client = None,
-        use_layout = False,
-        add_embeddings = False,
-        azure_credential = None,
-        embedding_endpoint = None
-    ):
-
-    if not form_recognizer_client:
-        form_recognizer_client = SingletonFormRecognizerClient()
-
+    file_path: str, # !IMP: Please keep this as the first argument
+    directory_path: str,
+    credential: Any = None,
+    ignore_errors: bool = False,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix = None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = FILE_FORMAT_DICT.keys(),
+    form_recognizer_client: Any = None,
+    doc_extract_service: Service = None,
+    embedding_service: Service = None,
+    ingestion_watchtower_client: IngestionWatchTower = None
+):
     is_error = False
     result = None
-    # if True:
     try:
         url_path = None
         rel_file_path = os.path.relpath(file_path, directory_path)
         if url_prefix:
-            url_path = url_prefix + rel_file_path
+            # url_path = url_prefix + rel_file_path
+            url_path = url_prefix.format(rel_file_path)
             url_path = convert_escaped_to_posix(url_path)
 
         result = chunk_file(
             file_path,
+            credential=credential,
             ignore_errors=ignore_errors,
             num_tokens=num_tokens,
             min_chunk_size=min_chunk_size,
@@ -896,10 +939,9 @@ def process_file(
             token_overlap=token_overlap,
             extensions_to_process=extensions_to_process,
             form_recognizer_client=form_recognizer_client,
-            use_layout=use_layout,
-            add_embeddings=add_embeddings,
-            azure_credential=azure_credential,
-            embedding_endpoint=embedding_endpoint
+            doc_extract_service=doc_extract_service,
+            embedding_service=embedding_service,
+            ingestion_watchtower_client=ingestion_watchtower_client
         )
         for chunk_idx, chunk_doc in enumerate(result.chunks):
             chunk_doc.filepath = rel_file_path
@@ -907,65 +949,83 @@ def process_file(
     except Exception as e:
         if not ignore_errors:
             raise e
-        print(f"File ({file_path}) failed with ", e)
+        logging.info(f"File ({file_path}) failed with ", e)
         is_error = True
         result = None
     return result, is_error
 
+
 def chunk_blob_container(
-        blob_url: str,
-        credential,
-        ignore_errors: bool = True,
-        num_tokens: int = 1024,
-        min_chunk_size: int = 10,
-        url_prefix = None,
-        token_overlap: int = 0,
-        extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
-        form_recognizer_client = None,
-        use_layout = False,
-        njobs=4,
-        add_embeddings = False,
-        azure_credential = None,
-        embedding_endpoint = None
+    blob_url: str,
+    staging_path: str = None,
+    credential: Any = None,
+    ignore_errors: bool = True,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix = None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
+    doc_extract_service: Service = None,
+    embedding_service: Service = None,
+    ingestion_watchtower: DBClient = None,
+    njobs: int = 4
 ):
-    with tempfile.TemporaryDirectory() as local_data_folder:
-        print(f'Downloading {blob_url} to local folder')
-        downloadBlobUrlToLocalFolder(blob_url, local_data_folder, credential)
-        print(f'Downloaded.')
+    if staging_path:
+        logging.info(f'Downloading {blob_url} to local folder')
+        downloadBlobUrlToLocalFolder(blob_url, staging_path, credential)
+        logging.info(f'Downloaded.')
 
         result = chunk_directory(
-            local_data_folder,
+            staging_path,
+            credential=credential,
             ignore_errors=ignore_errors,
             num_tokens=num_tokens,
             min_chunk_size=min_chunk_size,
             url_prefix=url_prefix,
             token_overlap=token_overlap,
             extensions_to_process=extensions_to_process,
-            form_recognizer_client=form_recognizer_client,
-            use_layout=use_layout,
+            doc_extract_service=doc_extract_service,
+            embedding_service=embedding_service,
+            ingestion_watchtower=ingestion_watchtower,
             njobs=njobs,
-            add_embeddings=add_embeddings,
-            azure_credential=azure_credential,
-            embedding_endpoint=embedding_endpoint
         )
+    else:
+        with tempfile.TemporaryDirectory() as local_data_folder:
+            logging.info(f'Downloading {blob_url} to local folder')
+            downloadBlobUrlToLocalFolder(blob_url, local_data_folder, credential)
+            logging.info(f'Downloaded.')
+
+            result = chunk_directory(
+                local_data_folder,
+                credential=credential,
+                ignore_errors=ignore_errors,
+                num_tokens=num_tokens,
+                min_chunk_size=min_chunk_size,
+                url_prefix=url_prefix,
+                token_overlap=token_overlap,
+                extensions_to_process=extensions_to_process,
+                doc_extract_service=doc_extract_service,
+                embedding_service=embedding_service,
+                ingestion_watchtower=ingestion_watchtower,
+                njobs=njobs,
+            )
 
     return result
 
 
 def chunk_directory(
-        directory_path: str,
-        ignore_errors: bool = False,
-        num_tokens: int = 1024,
-        min_chunk_size: int = 10,
-        url_prefix = None,
-        token_overlap: int = 0,
-        extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
-        form_recognizer_client = None,
-        use_layout = False,
-        njobs=4,
-        add_embeddings = False,
-        azure_credential = None,
-        embedding_endpoint = None
+    directory_path: str,
+    credential: Any = None,
+    ignore_errors: bool = True,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix = None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
+    doc_extract_service: Service = None,
+    embedding_service: Service = None,
+    ingestion_watchtower: DBClient = None,
+    njobs: int = 4
 ):
     """
     Chunks the given directory recursively
@@ -994,20 +1054,43 @@ def chunk_directory(
 
     all_files_directory = get_files_recursively(directory_path)
     files_to_process = [file_path for file_path in all_files_directory if os.path.isfile(file_path)]
-    print(f"Total files to process={len(files_to_process)} out of total directory size={len(all_files_directory)}")
+    logging.info(f"Total files to process={len(files_to_process)} out of total directory size={len(all_files_directory)}")
+    
+    if doc_extract_service:
+        form_recognizer_client = DocumentIntelligenceClient(
+            endpoint=doc_extract_service.endpoint,
+            credential=AzureKeyCredential(doc_extract_service.secret),
+            api_version=doc_extract_service.specs.get("api_version","2023-10-31-preview")
+        )
+    else:
+        form_recognizer_client = None
 
+    if ingestion_watchtower:
+        ingestion_watchtower_client = IngestionWatchTower(
+            dbclient=ingestion_watchtower
+        )
+    else:
+        ingestion_watchtower_client = None
 
     if njobs==1:
-        print("Single process to chunk and parse the files. --njobs > 1 can help performance.")
+        logging.info("Single process to chunk and parse the files. --njobs > 1 can help performance.")
         for file_path in tqdm(files_to_process):
             total_files += 1
-            result, is_error = process_file(file_path=file_path,directory_path=directory_path, ignore_errors=ignore_errors,
-                                       num_tokens=num_tokens,
-                                       min_chunk_size=min_chunk_size, url_prefix=url_prefix,
-                                       token_overlap=token_overlap,
-                                       extensions_to_process=extensions_to_process,
-                                       form_recognizer_client=form_recognizer_client, use_layout=use_layout, add_embeddings=add_embeddings,
-                                       azure_credential=azure_credential, embedding_endpoint=embedding_endpoint)
+            result, is_error = process_file(
+                file_path=file_path,
+                directory_path=directory_path,
+                credential=credential,
+                ignore_errors=ignore_errors,
+                num_tokens=num_tokens,
+                min_chunk_size=min_chunk_size,
+                url_prefix=url_prefix,
+                token_overlap=token_overlap,
+                extensions_to_process=extensions_to_process,
+                form_recognizer_client=form_recognizer_client,
+                doc_extract_service=doc_extract_service,
+                embedding_service=embedding_service,
+                ingestion_watchtower_client=ingestion_watchtower_client
+            )
             if is_error:
                 num_files_with_errors += 1
                 continue
@@ -1016,18 +1099,38 @@ def chunk_directory(
             num_files_with_errors += result.num_files_with_errors
             skipped_chunks += result.skipped_chunks
     elif njobs > 1:
-        print(f"Multiprocessing with njobs={njobs}")
-        process_file_partial = partial(process_file, directory_path=directory_path, ignore_errors=ignore_errors,
-                                       num_tokens=num_tokens,
-                                       min_chunk_size=min_chunk_size, url_prefix=url_prefix,
-                                       token_overlap=token_overlap,
-                                       extensions_to_process=extensions_to_process,
-                                       form_recognizer_client=None, use_layout=use_layout, add_embeddings=add_embeddings,
-                                       azure_credential=azure_credential, embedding_endpoint=embedding_endpoint)
-        # with ProcessPoolExecutor(max_workers=njobs) as executor:
+        logging.info(f"Multiprocessing with njobs={njobs}")
+        process_file_partial = partial(
+            process_file,
+            directory_path=directory_path,
+            credential=credential,
+            ignore_errors=ignore_errors,
+            num_tokens=num_tokens,
+            min_chunk_size=min_chunk_size,
+            url_prefix=url_prefix,
+            token_overlap=token_overlap,
+            extensions_to_process=extensions_to_process,
+            form_recognizer_client=form_recognizer_client,
+            doc_extract_service=doc_extract_service,
+            embedding_service=embedding_service,
+            ingestion_watchtower_client=ingestion_watchtower_client
+        )
         with ThreadPoolExecutor(max_workers=njobs) as executor:
-            futures = list(tqdm(executor.map(process_file_partial, files_to_process), total=len(files_to_process)))
-            for result, is_error in futures:
+            futures = []
+            for file_path in files_to_process:
+                futures.append(
+                    executor.submit(
+                        process_file_partial,
+                        file_path
+                    )
+                )
+            for f in tqdm(
+                as_completed(futures),
+                desc=f"Processing the files",
+                total=len(futures),
+            ):
+                result = f.result()[0]
+                is_error = f.result()[1]
                 total_files += 1
                 if is_error:
                     num_files_with_errors += 1
@@ -1046,31 +1149,32 @@ def chunk_directory(
         )
 
 
-class SingletonFormRecognizerClient:
-    instance = None
-    def __new__(cls, *args, **kwargs):
-        if not cls.instance:
-            print("SingletonFormRecognizerClient: Creating instance of Form recognizer per process")
-            url = os.getenv("FORM_RECOGNIZER_ENDPOINT")
-            key = os.getenv("FORM_RECOGNIZER_KEY")
-            if url and key:
-                cls.instance = DocumentIntelligenceClient(
-                    endpoint=url,
-                    credential=AzureKeyCredential(key),
-                    api_version="2023-10-31-preview"
-                )
-            else:
-                print("SingletonFormRecognizerClient: Skipping since credentials not provided. Assuming NO form recognizer extensions(like .pdf) in directory")
-                cls.instance = object() # dummy object
-        return cls.instance
+# class SingletonFormRecognizerClient:
+#     instance = None
+#     def __new__(cls, *args, **kwargs):
+#         if not cls.instance:
+#             logging.info("SingletonFormRecognizerClient: Creating instance of Form recognizer per process")
+#             url = os.getenv("FORM_RECOGNIZER_ENDPOINT")
+#             key = os.getenv("FORM_RECOGNIZER_KEY")
+#             api_version = os.getenv("FORM_RECOGNIZER_API_VERSION")
+#             if url and key:
+#                 cls.instance = DocumentIntelligenceClient(
+#                     endpoint=url,
+#                     credential=AzureKeyCredential(key),
+#                     api_version=api_version
+#                 )
+#             else:
+#                 logging.info("SingletonFormRecognizerClient: Skipping since credentials not provided. Assuming NO form recognizer extensions(like .pdf) in directory")
+#                 cls.instance = object() # dummy object
+#         return cls.instance
 
-    def __getstate__(self):
-        return self.url, self.key
+#     def __getstate__(self):
+#         return self.url, self.key, self.api_version
 
-    def __setstate__(self, state):
-        url, key = state
-        self.instance = DocumentIntelligenceClient(
-            endpoint=url,
-            credential=AzureKeyCredential(key),
-            api_version="2023-10-31-preview"
-        )
+#     def __setstate__(self, state):
+#         url, key, api_version = state
+#         self.instance = DocumentIntelligenceClient(
+#             endpoint=url,
+#             credential=AzureKeyCredential(key),
+#             api_version=api_version
+#         )

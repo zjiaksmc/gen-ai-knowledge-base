@@ -1,4 +1,6 @@
 import os
+import logging
+import hashlib
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from dataclasses_json import dataclass_json
@@ -47,57 +49,74 @@ class DBClient:
         url="postgresql+psycopg2://username:password@host:port/database"
     )
     cache: Connection = Connection(url="redis://@localhost:6377/0")
-    index_store: Connection = Connection(url="mongodb+srv://username:password@akb-cosmosdb-mongo.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000")
 
 
 @dataclass_json
 @dataclass
-class EmbeddingConfig:
+class Service:
+
+    type: str
+    endpoint: str
+    secret: Optional[str] = None
+    specs: Optional[dict] = field(default_factory=dict)
+
+    @property
+    def checksum(self):
+        return hashlib.md5(" ".join([self.type, self.endpoint, str(self.specs)]).encode()).hexdigest()
+
+    def __post_init__(self):
+        if self.type == "openai_embedding" and not ("deployment" in self.specs or "api_version" in self.specs):
+            raise Exception("ERROR: deployment name and api_version are required by OpenAI Embedding service. Please provide these values.")
+        if self.type == "azure_doc_intelligence" and not ("model_type" in self.specs):
+            raise Exception("ERROR: model_type is required by Azure Doc Intelligence service. Please provide these values.")
+
+
+@dataclass_json
+@dataclass
+class IndexStore: 
     """
-    Embedding configuration
+    Index store for AI to retrieve embeddings
+    """
+    index_name: str
+    index_service: Service
+    semantic_config_name: str = "semantic_default"
+    vector_config_name: Optional[str] = None
+    embedding_service: Optional[Service] = None
+    doc_extract_type: Optional[str] = "OCR"
+    doc_extract_service: Optional[Service] = None
+
+    def __post_init__(self):
+        if self.vector_config_name and not self.embedding_service:
+            raise Exception("ERROR: Vector search is enabled in the config, but no embedding model endpoint and key were provided. Please provide these values or disable vector search.")
+        if self.doc_extract_type in ["DOC_ANALYSIS","OCR"] and (not self.doc_extract_service):
+            raise Exception("ERROR: Document extraction requires Doc Intelligence service, but no service endpoint and key were provided. Please provide these values.")
+
+@dataclass_json
+@dataclass
+class RetrievalMethod:
+    """
+    Retrieval methodology
+    """
+    type: str = "WEB_SEARCH" # PROPRIETARY_SEARCH, WEB_SEARCH, ARVIX_SEARCH
+    index_store: Optional[IndexStore] = None
+
+    def __post_init__(self):
+        if not self.type in ["PROPRIETARY_SEARCH", "WEB_SEARCH", "ARVIX_SEARCH"]:
+            raise Exception(f"ERROR: retrieval type {self.type} is not yet supported. Please specify one of the following: [BINARY, DOC_ANALYSIS, OCR].")
+        if self.type == "PROPRIETARY_SEARCH" and (not self.index_store):
+            raise Exception("ERROR: Propiertary search requires an index store to retrieve internal information, but no index store endpoint and key were provided. Please provide these values.")
+
+@dataclass_json
+@dataclass
+class IngestionConfig:
+    """
+    Data ingestion configuration
     """
     data_path: str
-    connection_string: str
-    database_name: str
-    collection_name: str
-    index_name: str
-    vector_field: str
+    staging_path: str
+    retrieval_method: RetrievalMethod
+    database: Optional[DBClient] = None
+    url_prefix: Optional[str] = None
     language: Optional[str] = None
     chunk_size: Optional[int] = 1024
     token_overlap: Optional[int] = 128
-
-
-@dataclass_json
-@dataclass
-class PromptExample:
-    """
-    Prompt example
-    """
-    input: str
-    output: str
-
-
-@dataclass_json
-@dataclass
-class StructuredPrompt:
-    """
-    Prompt configuration.
-    """
-    context: Optional[str] = None
-    examples: Optional[List[PromptExample]] = field(default_factory=list)
-    input_template: Optional[str] = None
-    web_search_template: Optional[str] = None
-    proprietary_search_template: Optional[str] = None
-
-
-@dataclass_json
-@dataclass
-class ModelConfig:
-    """
-    Model input
-    """
-
-    model_id: str
-    tag: Optional[str] = None
-    prompt: Optional[StructuredPrompt] = None
-    parameters: Optional[dict] = field(default_factory=dict)

@@ -93,10 +93,10 @@ def create_or_update_vector_search_index(
     try:
         dbs=mongo_client.list_database_names()
         if (database_name in dbs):
-            print(f"database {database_name} exist")
+            logging.info(f"database {database_name} exist")
             collections=mongo_client[database_name].list_collection_names()
             if (collection_name in collections):
-                print(f"collection {collection_name} exist")
+                logging.info(f"collection {collection_name} exist")
 
         mongo_collection = mongo_client[database_name][collection_name]  
         indexes = mongo_collection.index_information()
@@ -135,10 +135,10 @@ def upsert_documents_to_index(
 
         try:
             mongo_collection.insert_one(finalDocChunk)
-            print(f"Upsert doc chunk {document.id} successfully")
+            logging.info(f"Upsert doc chunk {document.id} successfully")
         
         except Exception as e:
-            print(f"Failed to upsert doc chunk {document.id}")
+            logging.info(f"Failed to upsert doc chunk {document.id}")
             continue
 
 def validate_index(
@@ -178,7 +178,7 @@ def create_index(config, credential, form_recognizer_client=None, embedding_mode
         raise Exception(f"Failed to create or update index {index_name}")
     
     # chunk directory
-    print("Chunking directory...")
+    logging.info("Chunking directory...")
     add_embeddings = True
 
     result = chunk_directory(config.data_path, num_tokens=config.chunk_size, token_overlap=config.token_overlap,
@@ -188,19 +188,19 @@ def create_index(config, credential, form_recognizer_client=None, embedding_mode
     if len(result.chunks) == 0:
         raise Exception("No chunks found. Please check the data path and chunk size.")
 
-    print(f"Processed {result.total_files} files")
-    print(f"Unsupported formats: {result.num_unsupported_format_files} files")
-    print(f"Files with errors: {result.num_files_with_errors} files")
-    print(f"Found {len(result.chunks)} chunks")
+    logging.info(f"Processed {result.total_files} files")
+    logging.info(f"Unsupported formats: {result.num_unsupported_format_files} files")
+    logging.info(f"Files with errors: {result.num_files_with_errors} files")
+    logging.info(f"Found {len(result.chunks)} chunks")
 
     # upsert documents to index
-    print("Upserting documents to index...")
+    logging.info("Upserting documents to index...")
     upsert_documents_to_index(mongo_client, database_name, collection_name, result.chunks)
 
     # check if index is ready/validate index
-    print("Validating index...")
+    logging.info("Validating index...")
     validate_index(mongo_client, database_name, collection_name, index_name)
-    print("Index validation completed")
+    logging.info("Index validation completed")
 
 def valid_range(n):
     n = int(n)

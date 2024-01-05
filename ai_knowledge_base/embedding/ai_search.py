@@ -3,14 +3,17 @@ import argparse
 import dataclasses
 import json
 import os
+import logging
 import subprocess
 
 import requests
 import time
 from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient 
 from azure.search.documents import SearchClient
 from tqdm import tqdm
 
+from ..config import *
 from ..utils.document import chunk_directory, chunk_blob_container
 
 SUPPORTED_LANGUAGE_CODES = {
@@ -53,22 +56,25 @@ SUPPORTED_LANGUAGE_CODES = {
 
 
 def create_or_update_search_index(
-        service_endpoint,
-        admin_key,
-        index_name="default-index", 
-        semantic_config_name="default", 
-        credential=None, 
-        language=None,
-        vector_config_name=None
-    ):
-    
-    if credential is None and admin_key is None:
+    config: IndexStore,
+    credential: Any=None,
+    language: str=None,
+
+    # service_endpoint,
+    # admin_key,
+    # index_name="default-index", 
+    # semantic_config_name="default", 
+    # credential=None, 
+    # language=None,
+    # vector_config_name=None
+):
+    if credential is None and config.index_service.secret is None:
         raise ValueError("credential and admin key cannot be None")
-    
-    url = f"{service_endpoint}/indexes/{index_name}?api-version=2023-11-01"
+    api_version = config.index_service.specs.get("api_version","2023-11-01")
+    url = f"{config.index_service.endpoint}/indexes/{config.index_name}?api-version={api_version}"
     headers = {
         "Content-Type": "application/json",
-        "api-key": admin_key,
+        "api-key": config.index_service.secret,
     }
 
     body = {
@@ -121,7 +127,7 @@ def create_or_update_search_index(
         "semantic": {
             "configurations": [
                 {
-                    "name": semantic_config_name,
+                    "name": config.semantic_config_name,
                     "prioritizedFields": {
                         "titleField": {"fieldName": "title"},
                         "prioritizedContentFields": [{"fieldName": "content"}],
@@ -132,14 +138,14 @@ def create_or_update_search_index(
         },
     }
 
-    if vector_config_name:
+    if config.vector_config_name:
         body["fields"].append({
             "name": "contentVector",
             "type": "Collection(Edm.Single)",
             "searchable": True,
             "retrievable": True,
             "dimensions": 1536,
-            "vectorSearchProfile": vector_config_name
+            "vectorSearchProfile": config.vector_config_name
         })
 
         body["vectorSearch"] = {
@@ -167,7 +173,7 @@ def create_or_update_search_index(
             ],
             "profiles": [
                 {
-                    "name": vector_config_name,
+                    "name": config.vector_config_name,
                     "algorithm": "hnsm-fast",
                 }
             ]
@@ -175,19 +181,22 @@ def create_or_update_search_index(
 
     response = requests.put(url, json=body, headers=headers)
     if response.status_code == 201:
-        print(f"Created search index {index_name}")
+        print(f"Created search index {config.index_name}")
     elif response.status_code == 204:
-        print(f"Updated existing search index {index_name}")
+        print(f"Updated existing search index {config.index_name}")
     else:
         print(response.text)
-        raise Exception(f"Failed to create search index. Error: {response}")
-        
-    
+        raise Exception(f"Failed to create search index. Error: {response.text}")
     return True
 
 
-def upload_documents_to_index(endpoint, index_name, docs, admin_key, credential=None, upload_batch_size = 50):
-    if credential is None and admin_key is None:
+def upload_documents_to_index(
+    docs: List,
+    config: IndexStore,
+    credential: Any=None,
+    upload_batch_size: int = 50
+):
+    if credential is None and config.index_service.secret is None:
         raise ValueError("credential and admin_key cannot be None")
     
     to_upload_dicts = []
@@ -204,9 +213,9 @@ def upload_documents_to_index(endpoint, index_name, docs, admin_key, credential=
         id += 1
 
     search_client = SearchClient(
-        endpoint=endpoint,
-        index_name=index_name,
-        credential=AzureKeyCredential(admin_key),
+        endpoint=config.index_service.endpoint,
+        index_name=config.index_name,
+        credential=AzureKeyCredential(config.index_service.secret),
     )
     # Upload the documents in batches of upload_batch_size
     for i in tqdm(range(0, len(to_upload_dicts), upload_batch_size), desc="Indexing Chunks..."):
@@ -223,14 +232,16 @@ def upload_documents_to_index(endpoint, index_name, docs, admin_key, credential=
             raise Exception(f"INDEXING FAILED for {num_failures} documents. Please recreate the index."
                             f"To Debug: PLEASE CHECK chunk_size and upload_batch_size. \n Error Messages: {list(errors)}")
 
-def validate_index(service_endpoint, index_name, admin_key):
-    api_version = "2021-04-30-Preview"
 
+def validate_index(
+    config: IndexStore,
+    credential: Any=None
+):
     headers = {
         "Content-Type": "application/json", 
-        "api-key": admin_key}
-    params = {"api-version": api_version}
-    url = f"{service_endpoint}/indexes/{index_name}/stats"
+        "api-key": config.index_service.secret}
+    params = {"api-version": config.index_service.specs.get("api_version", "2023-11-01")}
+    url = f"{config.index_service.endpoint}/indexes/{config.index_name}/stats"
     for retry_count in range(5):
         response = requests.get(url, headers=headers, params=params)
 
@@ -256,54 +267,69 @@ def validate_index(service_endpoint, index_name, admin_key):
                 print(f"Request failed. Please investigate. Status code: {response.status_code}")
             break
 
-def create_index(config, credential, form_recognizer_client=None, embedding_model_endpoint=None, use_layout=False, njobs=4):
-    search_service_endpoint = config.search_service_endpoint
-    index_name = config.index_name
-    language = config.language
 
+def create_index(
+    config: IngestionConfig,
+    credential: Any=None,
+    njobs: int = 4
+):
+    language = config.language
     if language and language not in SUPPORTED_LANGUAGE_CODES:
         raise Exception(f"ERROR: Ingestion does not support {language} documents. "
                         f"Please use one of {SUPPORTED_LANGUAGE_CODES}."
                         f"Language is set as two letter code for e.g. 'en' for English."
                         f"If you donot want to set a language just remove this prompt config or set as None")
 
+    # retrieval methodology
+    retrieval_method = config.retrieval_method
+    if retrieval_method.type != "PROPRIETARY_SEARCH":
+        print(f"No need to ingest document for retrieval type {retrieval_method.type}")
+        return
+    
     # create or update search index with compatible schema
-    admin_key = os.environ.get("AZURE_SEARCH_ADMIN_KEY", None)
+    index_store = retrieval_method.index_store
     if not create_or_update_search_index(
-        search_service_endpoint,
-        admin_key,
-        index_name,
-        config.semantic_config_name,
+        index_store,
         credential,
         language,
-        vector_config_name=config.vector_config_name
         ):
-        raise Exception(f"Failed to create or update index {index_name}")
-    
-    # data_configs = []
-    # if "data_path" in config:
-    #     data_configs.append({
-    #         "path": config.data_path,
-    #         "url_prefix": config.url_prefix,
-    #     })
-    # if "data_paths" in config:
-    #     data_configs.extend(config.data_paths)
+        raise Exception(f"Failed to create or update index {index_store.index_name}")
 
-    # for data_config in data_configs:
     # chunk directory
     print(f"Chunking path {config.data_path}...")
-    add_embeddings = False
-    if config.vector_config_name and embedding_model_endpoint:
-        add_embeddings = True
-
     if "blob.core" in config.data_path:
-        result = chunk_blob_container(config.data_path, credential=credential, num_tokens=config.chunk_size, token_overlap=config.token_overlap,
-                            azure_credential=credential, form_recognizer_client=form_recognizer_client, use_layout=use_layout, njobs=njobs,
-                            add_embeddings=add_embeddings, embedding_endpoint=embedding_model_endpoint, url_prefix=config.url_prefix)
+        result = chunk_blob_container(
+            config.data_path,
+            staging_path=config.staging_path,
+            credential=credential,
+            # Chunk specs
+            num_tokens=config.chunk_size,
+            token_overlap=config.token_overlap,
+            # Doc Extraction specs
+            doc_extract_service=index_store.doc_extract_service if index_store.doc_extract_type in ["DOC_ANALYSIS","OCR"] else None,
+            # Embedding specs
+            embedding_service=index_store.embedding_service,
+            # Optional specs
+            ingestion_watchtower=config.database,
+            url_prefix=config.url_prefix,
+            njobs=njobs,
+        )
     elif os.path.exists(config.data_path):
-        result = chunk_directory(config.data_path, num_tokens=config.chunk_size, token_overlap=config.token_overlap,
-                                azure_credential=credential, form_recognizer_client=form_recognizer_client, use_layout=use_layout, njobs=njobs,
-                                add_embeddings=add_embeddings, embedding_endpoint=embedding_model_endpoint, url_prefix=config.url_prefix)
+        result = chunk_directory(
+            config.data_path,
+            credential=credential,
+            # Chunk specs
+            num_tokens=config.chunk_size,
+            token_overlap=config.token_overlap,
+            # Doc Extraction specs
+            doc_extract_service=index_store.doc_extract_service if index_store.doc_extract_type in ["DOC_ANALYSIS","OCR"] else None,
+            # Embedding specs
+            embedding_service=index_store.embedding_service,
+            # Optional specs
+            ingestion_watchtower=config.database,
+            url_prefix=config.url_prefix,
+            njobs=njobs,
+        )
     else:
         raise Exception(f"Path {config.data_path} does not exist and is not a blob URL. Please check the path and try again.")
 
@@ -317,11 +343,18 @@ def create_index(config, credential, form_recognizer_client=None, embedding_mode
 
     # upload documents to index
     print("Uploading documents to index...")
-    upload_documents_to_index(search_service_endpoint, index_name, result.chunks, admin_key, credential)
+    upload_documents_to_index(
+        result.chunks,
+        index_store,
+        credential
+    )
 
     # check if index is ready/validate index
     print("Validating index...")
-    validate_index(search_service_endpoint, index_name, admin_key)
+    validate_index(
+        index_store,
+        credential
+    )
     print("Index validation completed")
 
 

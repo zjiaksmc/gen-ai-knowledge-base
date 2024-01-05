@@ -1,7 +1,8 @@
-PG_HOST=akb-db.postgres.database.azure.com
-PG_UNAME=akb_admin
-PG_SECRET=5TkoQ2y-C+^+G5<S
-PG_DB=ratchet
+DB_HOST=akb-db.postgres.database.azure.com
+DB_UNAME=akb_admin
+DB_SECRET=5TkoQ2y-C+^+G5<S
+DB_EMBEDDING_DB=bd_navigator
+DB_APP_DB=bd_navigator
 OPENAI_API_ENDPOINT=akb-openai-gpt4.openai.azure.com
 OPENAI_API_KEY=aef2546b927d431196a68727ff9033e8
 OPENAI_CHAT_DEPLOYMENT=chat-gpt4-32k
@@ -16,3 +17,7 @@ INDEX_STORE_SECRET=5TkoQ2y-C+^+G5<S
 CACHE_HOST=aidf-cache.redis.cache.windows.net
 CACHE_SECRET=fKPWbbOrbgvQI46TRiY04UjcFLH33GVTcAzCaMzMmYs=
 CACHE_PORT=6380
+AZURE_SP_SECRET=5bm8Q~QyJb.eWcbmUMM8ccW7lZrf~JNrHd3VYdt~
+AZURE_SP_CLIENTID=61286a92-ea51-4fbe-b09b-1393aa64f9a7
+AZURE_SP_TENANTID=50225b46-8a5b-4a27-b140-349ac9c7b83c
+ISSUER_URL=https://login.microsoftonline.com/50225b46-8a5b-4a27-b140-349ac9c7b83c/v2.0
