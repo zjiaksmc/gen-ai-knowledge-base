@@ -109,6 +109,17 @@ class IngestionWatchTower:
     def __init__(self, dbclient=None):
         self.rdbms = RDBMS.from_url(dbclient.db.url) if dbclient else None
 
+    def query_document_ingestion(self, query):
+        try:
+        # if True:
+            with Session(self.rdbms.db) as conn:
+                ingestions = conn.execute(query).all()
+            return ingestions
+        except:
+            logging.error(
+                "RDBMS is not available, no ingestion history can be retrieved")
+            return []
+
     def load_document_ingestion(self, document_ingestion):
         """
         Load document ingestion records from database

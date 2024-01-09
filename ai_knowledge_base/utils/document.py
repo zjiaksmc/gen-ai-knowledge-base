@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from typing import Callable, List, Dict, Optional, Generator, Tuple, Union
+from sqlalchemy.sql import text
 
 import markdown
 import tiktoken
@@ -444,7 +445,14 @@ parser_factory = ParserFactory()
 
 class UnsupportedFormatError(Exception):
     """Exception raised when a format is not supported by a parser."""
+    pass
 
+class SkipFileException(Exception):
+    """Exception raised when a file is skipped as it is already processed."""
+    pass
+
+class InternalException(Exception):
+    """Exception raised when encounter an unknown error."""
     pass
 
 
@@ -819,6 +827,13 @@ def chunk_file(
     })
     update = False
     try:
+        # temporary process
+        # if file_extension != 'xlsx':
+        #     return ChunkingResult(
+        #         chunks=[],
+        #         total_files=1,
+        #         num_files_skipped=1,
+        #     )
         if not file_format:
             raise UnsupportedFormatError(f"{file_name} is not supported")
         # retrieve content if the file has been processed before
@@ -830,6 +845,8 @@ def chunk_file(
                 cracked_pdf = True
             else:
                 cracked_pdf = False
+            new_ingestion.extraction_service_checksum = hist_ingestion.extraction_service_checksum
+            new_ingestion.structured_content = hist_ingestion.structured_content
             logging.debug(f"Load previous extracted content from database for document {url}")
         else:
             if file_format in ["pdf"]:
@@ -849,13 +866,17 @@ def chunk_file(
                 else:
                     content = extract_other_content(file_path)
                 cracked_pdf = False
+            new_ingestion.extraction_service_checksum = doc_extract_service.checksum if doc_extract_service else None
+            new_ingestion.structured_content = content
             update = True
             logging.debug(f"Extract content for document {url}")
-        new_ingestion.extraction_service_checksum = doc_extract_service.checksum if doc_extract_service else None
-        new_ingestion.structured_content = content
 
         if hist_ingestion and embedding_service and hist_ingestion.embedding_service_checksum == embedding_service.checksum:
             chunk_result = ChunkingResult.from_json(hist_ingestion.embedding)
+            new_ingestion.embedding_service_checksum = hist_ingestion.embedding_service_checksum
+            new_ingestion.embedding = hist_ingestion.embedding
+            new_ingestion.status = hist_ingestion.status
+            new_ingestion.error = hist_ingestion.error
             logging.debug(f"Load previous embedding content from database for document {url}")
         else:
             chunk_result = chunk_content(
@@ -872,36 +893,37 @@ def chunk_file(
                 use_layout=use_layout,
                 embedding_service=embedding_service
             )
+            new_ingestion.embedding_service_checksum = embedding_service.checksum if embedding_service else None
+            new_ingestion.embedding = chunk_result.to_json()
+            new_ingestion.status = "ready"
+            new_ingestion.error = None
             update = True
             logging.debug(f"Embedding content for document {url}")
-        new_ingestion.embedding_service_checksum = embedding_service.checksum if embedding_service else None
-        new_ingestion.embedding = chunk_result.to_json()
-        new_ingestion.status = "ready"
-        new_ingestion.error = None
+
+        if update:
+            new_ingestion.updated_dt = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+            ingestion_watchtower_client.persist_document_ingestion(new_ingestion)
+            return chunk_result
+        else:
+            return ChunkingResult(
+                chunks=[],
+                total_files=1,
+                num_files_skipped=1,
+            )
     except (UnsupportedFormatError, ValueError) as e:
         new_ingestion.status = "error"
         new_ingestion.error = str(e)
-        chunk_result = ChunkingResult(
-            chunks=[], total_files=1, num_unsupported_format_files=1
-        )
-        update = True
+        new_ingestion.updated_dt = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
+        ingestion_watchtower_client.persist_document_ingestion(new_ingestion)
         logging.debug(f"Failed to extract content for document {url} due to {str(e)}")
+        raise e
     except Exception as e:
         new_ingestion.status = "error"
         new_ingestion.error = str(e)
-        chunk_result = ChunkingResult(
-            chunks=[], total_files=1, num_unsupported_format_files=1
-        )
-        update = True
-        logging.error(f"Failed to extract content for document {url} due to {str(e)}")
-
-    if update:
         new_ingestion.updated_dt = datetime.today().strftime('%Y-%m-%d %H:%M:%S')
-    else:
-        new_ingestion.updated_dt = hist_ingestion.updated_dt
-    ingestion_watchtower_client.persist_document_ingestion(new_ingestion)
-
-    return chunk_result
+        ingestion_watchtower_client.persist_document_ingestion(new_ingestion)
+        logging.error(f"Failed to extract content for document {url} due to {str(e)}")
+        raise e
 
 
 def process_file(
@@ -919,6 +941,7 @@ def process_file(
     embedding_service: Service = None,
     ingestion_watchtower_client: IngestionWatchTower = None
 ):
+    is_skip = False
     is_error = False
     result = None
     try:
@@ -943,16 +966,172 @@ def process_file(
             embedding_service=embedding_service,
             ingestion_watchtower_client=ingestion_watchtower_client
         )
+        if len(result.chunks)==0 and result.num_files_skipped > 0:
+            logging.info(f"File ({file_path}) is skipped")
+            return None, False, True
         for chunk_idx, chunk_doc in enumerate(result.chunks):
             chunk_doc.filepath = rel_file_path
             chunk_doc.metadata = json.dumps({"chunk_id": str(chunk_idx)})
+    except (UnsupportedFormatError, ValueError) as e:
+        if not ignore_errors:
+            raise e
+        logging.info(f"File ({file_path}) failed with ", e)
+        is_error = True
+        result = None
     except Exception as e:
         if not ignore_errors:
             raise e
         logging.info(f"File ({file_path}) failed with ", e)
         is_error = True
         result = None
-    return result, is_error
+    return result, is_error, is_skip
+
+
+def chunk_directory(
+    directory_path: str,
+    credential: Any = None,
+    ignore_errors: bool = True,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix = None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
+    doc_extract_service: Service = None,
+    embedding_service: Service = None,
+    ingestion_watchtower: DBClient = None,
+    njobs: int = 4
+):
+    """
+    Chunks the given directory recursively
+    Args:
+        directory_path (str): The directory to chunk.
+        ignore_errors (bool): If true, ignores errors and returns None.
+        num_tokens (int): The number of tokens to use for chunking.
+        min_chunk_size (int): The minimum chunk size.
+        url_prefix (str): The url prefix to use for the files. If None, the url will be None. If not None, the url will be url_prefix + relpath. 
+                            For example, if the directory path is /home/user/data and the url_prefix is https://example.com/data, 
+                            then the url for the file /home/user/data/file1.txt will be https://example.com/data/file1.txt
+        token_overlap (int): The number of tokens to overlap between chunks.
+        extensions_to_process (List[str]): The list of extensions to process. 
+        form_recognizer_client: Optional form recognizer client to use for pdf files.
+        use_layout (bool): If true, uses Layout model for pdf files. Otherwise, uses Read.
+        add_embeddings (bool): If true, adds a vector embedding to each chunk using the embedding model endpoint and key.
+
+    Returns:
+        List[Document]: List of chunked documents.
+    """
+    chunks = []
+    total_files = 0
+    num_unsupported_format_files = 0
+    num_files_with_errors = 0
+    num_files_skipped = 0
+    skipped_chunks = 0
+
+    all_files_directory = get_files_recursively(directory_path)
+    files_to_process = [file_path for file_path in all_files_directory if os.path.isfile(file_path)]
+    logging.info(f"Total files to process={len(files_to_process)} out of total directory size={len(all_files_directory)}")
+    
+    if doc_extract_service:
+        form_recognizer_client = DocumentIntelligenceClient(
+            endpoint=doc_extract_service.endpoint,
+            credential=AzureKeyCredential(doc_extract_service.secret),
+            api_version=doc_extract_service.specs.get("api_version","2023-10-31-preview")
+        )
+    else:
+        form_recognizer_client = None
+
+    if ingestion_watchtower:
+        ingestion_watchtower_client = IngestionWatchTower(
+            dbclient=ingestion_watchtower
+        )
+    else:
+        ingestion_watchtower_client = None
+
+    if njobs==1:
+        logging.info("Single process to chunk and parse the files. --njobs > 1 can help performance.")
+        for file_path in tqdm(files_to_process):
+            total_files += 1
+            result, is_error, is_skip = process_file(
+                file_path=file_path,
+                directory_path=directory_path,
+                credential=credential,
+                ignore_errors=ignore_errors,
+                num_tokens=num_tokens,
+                min_chunk_size=min_chunk_size,
+                url_prefix=url_prefix,
+                token_overlap=token_overlap,
+                extensions_to_process=extensions_to_process,
+                form_recognizer_client=form_recognizer_client,
+                doc_extract_service=doc_extract_service,
+                embedding_service=embedding_service,
+                ingestion_watchtower_client=ingestion_watchtower_client
+            )
+            if is_skip:
+                num_files_skipped += 1
+                continue
+            if is_error:
+                num_files_with_errors += 1
+                continue
+            # chunks.extend(result.chunks)
+            num_unsupported_format_files += result.num_unsupported_format_files
+            num_files_with_errors += result.num_files_with_errors
+            num_files_skipped += result.num_files_skipped
+            skipped_chunks += result.skipped_chunks
+    elif njobs > 1:
+        logging.info(f"Multiprocessing with njobs={njobs}")
+        process_file_partial = partial(
+            process_file,
+            directory_path=directory_path,
+            credential=credential,
+            ignore_errors=ignore_errors,
+            num_tokens=num_tokens,
+            min_chunk_size=min_chunk_size,
+            url_prefix=url_prefix,
+            token_overlap=token_overlap,
+            extensions_to_process=extensions_to_process,
+            form_recognizer_client=form_recognizer_client,
+            doc_extract_service=doc_extract_service,
+            embedding_service=embedding_service,
+            ingestion_watchtower_client=ingestion_watchtower_client
+        )
+        with ThreadPoolExecutor(max_workers=njobs) as executor:
+            futures = []
+            for file_path in files_to_process:
+                futures.append(
+                    executor.submit(
+                        process_file_partial,
+                        file_path
+                    )
+                )
+            for f in tqdm(
+                as_completed(futures),
+                desc=f"Processing the files",
+                total=len(futures),
+            ):
+                result = f.result()[0]
+                is_error = f.result()[1]
+                is_skip = f.result()[2]
+                total_files += 1
+                if is_skip:
+                    num_files_skipped += 1
+                    continue
+                if is_error:
+                    num_files_with_errors += 1
+                    continue
+                # chunks.extend(result.chunks)
+                num_unsupported_format_files += result.num_unsupported_format_files
+                num_files_with_errors += result.num_files_with_errors
+                num_files_skipped += result.num_files_skipped
+                skipped_chunks += result.skipped_chunks
+
+    return ChunkingResult(
+            chunks=chunks,
+            total_files=total_files,
+            num_unsupported_format_files=num_unsupported_format_files,
+            num_files_with_errors=num_files_with_errors,
+            num_files_skipped=num_files_skipped,
+            skipped_chunks=skipped_chunks,
+        )
 
 
 def chunk_blob_container(
@@ -1013,168 +1192,40 @@ def chunk_blob_container(
     return result
 
 
-def chunk_directory(
-    directory_path: str,
-    credential: Any = None,
-    ignore_errors: bool = True,
-    num_tokens: int = 1024,
-    min_chunk_size: int = 10,
+def load_index(
+    id_range: Tuple[int, int], 
     url_prefix = None,
-    token_overlap: int = 0,
-    extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
     doc_extract_service: Service = None,
     embedding_service: Service = None,
-    ingestion_watchtower: DBClient = None,
-    njobs: int = 4
-):
-    """
-    Chunks the given directory recursively
-    Args:
-        directory_path (str): The directory to chunk.
-        ignore_errors (bool): If true, ignores errors and returns None.
-        num_tokens (int): The number of tokens to use for chunking.
-        min_chunk_size (int): The minimum chunk size.
-        url_prefix (str): The url prefix to use for the files. If None, the url will be None. If not None, the url will be url_prefix + relpath. 
-                            For example, if the directory path is /home/user/data and the url_prefix is https://example.com/data, 
-                            then the url for the file /home/user/data/file1.txt will be https://example.com/data/file1.txt
-        token_overlap (int): The number of tokens to overlap between chunks.
-        extensions_to_process (List[str]): The list of extensions to process. 
-        form_recognizer_client: Optional form recognizer client to use for pdf files.
-        use_layout (bool): If true, uses Layout model for pdf files. Otherwise, uses Read.
-        add_embeddings (bool): If true, adds a vector embedding to each chunk using the embedding model endpoint and key.
+    ingestion_watchtower_client: IngestionWatchTower = None
+)-> List[Document]:
+    # if True:
+    try:
+        result = []
+        query = text(f"""
+        SELECT * FROM document_ingestion di
+        WHERE id >= {id_range[0]}
+        AND id <= {id_range[1]}
+        AND extraction_service_checksum = '{doc_extract_service.checksum}'
+        AND embedding_service_checksum = '{embedding_service.checksum}'
+        AND status = 'ready'
+        """)
+        docs= ingestion_watchtower_client.query_document_ingestion(query)
+        for doc in docs:
+            chunk_doc = ChunkingResult.from_json(doc.embedding)
+            rel_file_path = os.path.relpath(doc.url, url_prefix)
+            for chunk_id, chunk in enumerate(chunk_doc.chunks):
+                chunk.filepath = rel_file_path
+                chunk.id = f"{doc.id}-{chunk_id}"
+                chunk.url = doc.url
+                chunk.metadata = json.dumps({"chunk_id": f"{doc.id}-{chunk_id}"})
+                chunk_d = chunk.to_dict()
+                chunk_d.update({"@search.action": "mergeOrUpload"})
+                if "contentVector" in chunk_d and chunk_d["contentVector"] is None:
+                    del chunk_d["contentVector"]
+                result.append(chunk_d)
+    except Exception as e:
+        logging.info(f"Loading indexs from ({id_range}) failed with ", e)
+        result = []
+    return result
 
-    Returns:
-        List[Document]: List of chunked documents.
-    """
-    chunks = []
-    total_files = 0
-    num_unsupported_format_files = 0
-    num_files_with_errors = 0
-    skipped_chunks = 0
-
-    all_files_directory = get_files_recursively(directory_path)
-    files_to_process = [file_path for file_path in all_files_directory if os.path.isfile(file_path)]
-    logging.info(f"Total files to process={len(files_to_process)} out of total directory size={len(all_files_directory)}")
-    
-    if doc_extract_service:
-        form_recognizer_client = DocumentIntelligenceClient(
-            endpoint=doc_extract_service.endpoint,
-            credential=AzureKeyCredential(doc_extract_service.secret),
-            api_version=doc_extract_service.specs.get("api_version","2023-10-31-preview")
-        )
-    else:
-        form_recognizer_client = None
-
-    if ingestion_watchtower:
-        ingestion_watchtower_client = IngestionWatchTower(
-            dbclient=ingestion_watchtower
-        )
-    else:
-        ingestion_watchtower_client = None
-
-    if njobs==1:
-        logging.info("Single process to chunk and parse the files. --njobs > 1 can help performance.")
-        for file_path in tqdm(files_to_process):
-            total_files += 1
-            result, is_error = process_file(
-                file_path=file_path,
-                directory_path=directory_path,
-                credential=credential,
-                ignore_errors=ignore_errors,
-                num_tokens=num_tokens,
-                min_chunk_size=min_chunk_size,
-                url_prefix=url_prefix,
-                token_overlap=token_overlap,
-                extensions_to_process=extensions_to_process,
-                form_recognizer_client=form_recognizer_client,
-                doc_extract_service=doc_extract_service,
-                embedding_service=embedding_service,
-                ingestion_watchtower_client=ingestion_watchtower_client
-            )
-            if is_error:
-                num_files_with_errors += 1
-                continue
-            chunks.extend(result.chunks)
-            num_unsupported_format_files += result.num_unsupported_format_files
-            num_files_with_errors += result.num_files_with_errors
-            skipped_chunks += result.skipped_chunks
-    elif njobs > 1:
-        logging.info(f"Multiprocessing with njobs={njobs}")
-        process_file_partial = partial(
-            process_file,
-            directory_path=directory_path,
-            credential=credential,
-            ignore_errors=ignore_errors,
-            num_tokens=num_tokens,
-            min_chunk_size=min_chunk_size,
-            url_prefix=url_prefix,
-            token_overlap=token_overlap,
-            extensions_to_process=extensions_to_process,
-            form_recognizer_client=form_recognizer_client,
-            doc_extract_service=doc_extract_service,
-            embedding_service=embedding_service,
-            ingestion_watchtower_client=ingestion_watchtower_client
-        )
-        with ThreadPoolExecutor(max_workers=njobs) as executor:
-            futures = []
-            for file_path in files_to_process:
-                futures.append(
-                    executor.submit(
-                        process_file_partial,
-                        file_path
-                    )
-                )
-            for f in tqdm(
-                as_completed(futures),
-                desc=f"Processing the files",
-                total=len(futures),
-            ):
-                result = f.result()[0]
-                is_error = f.result()[1]
-                total_files += 1
-                if is_error:
-                    num_files_with_errors += 1
-                    continue
-                chunks.extend(result.chunks)
-                num_unsupported_format_files += result.num_unsupported_format_files
-                num_files_with_errors += result.num_files_with_errors
-                skipped_chunks += result.skipped_chunks
-
-    return ChunkingResult(
-            chunks=chunks,
-            total_files=total_files,
-            num_unsupported_format_files=num_unsupported_format_files,
-            num_files_with_errors=num_files_with_errors,
-            skipped_chunks=skipped_chunks,
-        )
-
-
-# class SingletonFormRecognizerClient:
-#     instance = None
-#     def __new__(cls, *args, **kwargs):
-#         if not cls.instance:
-#             logging.info("SingletonFormRecognizerClient: Creating instance of Form recognizer per process")
-#             url = os.getenv("FORM_RECOGNIZER_ENDPOINT")
-#             key = os.getenv("FORM_RECOGNIZER_KEY")
-#             api_version = os.getenv("FORM_RECOGNIZER_API_VERSION")
-#             if url and key:
-#                 cls.instance = DocumentIntelligenceClient(
-#                     endpoint=url,
-#                     credential=AzureKeyCredential(key),
-#                     api_version=api_version
-#                 )
-#             else:
-#                 logging.info("SingletonFormRecognizerClient: Skipping since credentials not provided. Assuming NO form recognizer extensions(like .pdf) in directory")
-#                 cls.instance = object() # dummy object
-#         return cls.instance
-
-#     def __getstate__(self):
-#         return self.url, self.key, self.api_version
-
-#     def __setstate__(self, state):
-#         url, key, api_version = state
-#         self.instance = DocumentIntelligenceClient(
-#             endpoint=url,
-#             credential=AzureKeyCredential(key),
-#             api_version=api_version
-#         )

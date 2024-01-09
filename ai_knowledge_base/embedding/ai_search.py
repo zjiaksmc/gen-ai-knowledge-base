@@ -12,9 +12,11 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient 
 from azure.search.documents import SearchClient
 from tqdm import tqdm
+from sqlalchemy.sql import text
 
 from ..config import *
-from ..utils.document import chunk_directory, chunk_blob_container
+from ..utils.document import chunk_directory, chunk_blob_container, load_index
+from ..utils.watchtower import IngestionWatchTower
 
 SUPPORTED_LANGUAGE_CODES = {
     "ar": "Arabic",
@@ -191,57 +193,106 @@ def create_or_update_search_index(
 
 
 def upload_documents_to_index(
-    docs: List,
-    config: IndexStore,
+    config: IngestionConfig,
     credential: Any=None,
-    upload_batch_size: int = 50
+    doc_batch_size: int = 10,
+    chunk_batch_size: int = 50
 ):
+    language = config.language
+    if language and language not in SUPPORTED_LANGUAGE_CODES:
+        raise Exception(f"ERROR: Ingestion does not support {language} documents. "
+                        f"Please use one of {SUPPORTED_LANGUAGE_CODES}."
+                        f"Language is set as two letter code for e.g. 'en' for English."
+                        f"If you donot want to set a language just remove this prompt config or set as None")
+    
     if credential is None and config.index_service.secret is None:
         raise ValueError("credential and admin_key cannot be None")
     
-    to_upload_dicts = []
-
-    id = 0
-    for d in docs:
-        if type(d) is not dict:
-            d = dataclasses.asdict(d)
-        # add id to documents
-        d.update({"@search.action": "upload", "id": str(id)})
-        if "contentVector" in d and d["contentVector"] is None:
-            del d["contentVector"]
-        to_upload_dicts.append(d)
-        id += 1
-
+    # retrieval methodology
+    retrieval_method = config.retrieval_method
+    if retrieval_method.type != "PROPRIETARY_SEARCH":
+        print(f"No need to ingest document for retrieval type {retrieval_method.type}")
+        return
+    
+    # create or update search index with compatible schema
+    index_store = retrieval_method.index_store
+    if not create_or_update_search_index(
+        index_store,
+        credential,
+        language,
+        ):
+        raise Exception(f"Failed to create or update index {index_store.index_name}")
     search_client = SearchClient(
-        endpoint=config.index_service.endpoint,
-        index_name=config.index_name,
-        credential=AzureKeyCredential(config.index_service.secret),
+        endpoint=index_store.index_service.endpoint,
+        index_name=index_store.index_name,
+        credential=AzureKeyCredential(index_store.index_service.secret),
     )
-    # Upload the documents in batches of upload_batch_size
-    for i in tqdm(range(0, len(to_upload_dicts), upload_batch_size), desc="Indexing Chunks..."):
-        batch = to_upload_dicts[i: i + upload_batch_size]
-        results = search_client.upload_documents(documents=batch)
-        num_failures = 0
-        errors = set()
-        for result in results:
-            if not result.succeeded:
-                print(f"Indexing Failed for {result.key} with ERROR: {result.error_message}")
-                num_failures += 1
-                errors.add(result.error_message)
-        if num_failures > 0:
-            raise Exception(f"INDEXING FAILED for {num_failures} documents. Please recreate the index."
-                            f"To Debug: PLEASE CHECK chunk_size and upload_batch_size. \n Error Messages: {list(errors)}")
+    ingestion_watchtower_client = IngestionWatchTower(
+        dbclient=config.database
+    )
 
+    # Upload the documents in batches of upload_batch_size
+    all_ids = [doc.id for doc in ingestion_watchtower_client.query_document_ingestion(
+        text(
+            """
+            SELECT id from document_ingestion where status = 'ready' order by id
+            """
+        )
+    )]
+    for i in tqdm(range(0, len(all_ids), doc_batch_size), desc="Uploading documents..."):
+        batch_ids = all_ids[i:i + doc_batch_size]
+        batch_chunks = load_index(
+            id_range=[batch_ids[0], batch_ids[-1]],
+            doc_extract_service=index_store.doc_extract_service if index_store.doc_extract_type in ["DOC_ANALYSIS","OCR"] else None,
+            # Embedding specs
+            embedding_service=index_store.embedding_service,
+            # Optional specs
+            ingestion_watchtower_client=ingestion_watchtower_client,
+            url_prefix=config.url_prefix
+        )
+        for j in range(0, len(batch_chunks), chunk_batch_size):
+            batch = batch_chunks[j:j + chunk_batch_size]
+            results = search_client.upload_documents(documents=batch)
+            num_failures = 0
+            errors = set()
+            for result in results:
+                if not result.succeeded:
+                    print(f"Indexing Failed for {result.key} with ERROR: {result.error_message}")
+                    num_failures += 1
+                    errors.add(result.error_message)
+            if num_failures > 0:
+                raise Exception(f"INDEXING FAILED for {num_failures} documents. Please recreate the index."
+                                f"To Debug: PLEASE CHECK chunk_size and upload_batch_size. \n Error Messages: {list(errors)}")
+
+    # Validate whether index created successfully
+    validate_index(config, credential)
+    
 
 def validate_index(
-    config: IndexStore,
+    config: IngestionConfig,
     credential: Any=None
 ):
+    language = config.language
+    if language and language not in SUPPORTED_LANGUAGE_CODES:
+        raise Exception(f"ERROR: Ingestion does not support {language} documents. "
+                        f"Please use one of {SUPPORTED_LANGUAGE_CODES}."
+                        f"Language is set as two letter code for e.g. 'en' for English."
+                        f"If you donot want to set a language just remove this prompt config or set as None")
+    
+    # retrieval methodology
+    retrieval_method = config.retrieval_method
+    if retrieval_method.type != "PROPRIETARY_SEARCH":
+        print(f"No need to ingest document for retrieval type {retrieval_method.type}")
+        return
+    
+    # create or update search index with compatible schema
+    index_store = retrieval_method.index_store
+    
     headers = {
         "Content-Type": "application/json", 
-        "api-key": config.index_service.secret}
-    params = {"api-version": config.index_service.specs.get("api_version", "2023-11-01")}
-    url = f"{config.index_service.endpoint}/indexes/{config.index_name}/stats"
+        "api-key": index_store.index_service.secret}
+    params = {"api-version": index_store.index_service.specs.get("api_version", "2023-11-01")}
+    url = f"{index_store.index_service.endpoint}/indexes/{index_store.index_name}/stats"
     for retry_count in range(5):
         response = requests.get(url, headers=headers, params=params)
 
@@ -288,12 +339,6 @@ def create_index(
     
     # create or update search index with compatible schema
     index_store = retrieval_method.index_store
-    if not create_or_update_search_index(
-        index_store,
-        credential,
-        language,
-        ):
-        raise Exception(f"Failed to create or update index {index_store.index_name}")
 
     # chunk directory
     print(f"Chunking path {config.data_path}...")
@@ -333,29 +378,11 @@ def create_index(
     else:
         raise Exception(f"Path {config.data_path} does not exist and is not a blob URL. Please check the path and try again.")
 
-    if len(result.chunks) == 0:
-        raise Exception("No chunks found. Please check the data path and chunk size.")
-
     print(f"Processed {result.total_files} files")
     print(f"Unsupported formats: {result.num_unsupported_format_files} files")
     print(f"Files with errors: {result.num_files_with_errors} files")
+    print(f"Files skipped: {result.num_files_skipped} files")
     print(f"Found {len(result.chunks)} chunks")
-
-    # upload documents to index
-    print("Uploading documents to index...")
-    upload_documents_to_index(
-        result.chunks,
-        index_store,
-        credential
-    )
-
-    # check if index is ready/validate index
-    print("Validating index...")
-    validate_index(
-        index_store,
-        credential
-    )
-    print("Index validation completed")
 
 
 def valid_range(n):

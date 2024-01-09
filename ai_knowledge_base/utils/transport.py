@@ -56,15 +56,26 @@ def worksheet_to_data(ws, locale=None, fs=None, default_cell_border="none"):
             f_cell = None
             if fs:
                 f_cell = fs[cell.coordinate]
-            cell_data = {
-                "column": cell.column,
-                "row": cell.row,
-                "value": cell.value,
-                "formatted_value": format_cell(cell, locale=locale, f_cell=f_cell),
-                # "attrs": {"id": get_cell_id(cell)},
-                "attrs": {},
-                "style": {"height": f"{height}pt"},
-            }
+            try:
+                cell_data = {
+                    "column": cell.column,
+                    "row": cell.row,
+                    "value": cell.value,
+                    "formatted_value": format_cell(cell, locale=locale, f_cell=f_cell),
+                    # "attrs": {"id": get_cell_id(cell)},
+                    "attrs": {},
+                    "style": {"height": f"{height}pt"},
+                }
+            except:
+                cell_data = {
+                    "column": cell.column,
+                    "row": cell.row,
+                    "value": cell.value,
+                    "formatted_value": cell.value,
+                    # "attrs": {"id": get_cell_id(cell)},
+                    "attrs": {},
+                    "style": {"height": f"{height}pt"},
+                }
             merged_cell_info = merged_cell_map.get(cell.coordinate, {})
             if merged_cell_info:
                 cell_data["attrs"].update(merged_cell_info["attrs"])
